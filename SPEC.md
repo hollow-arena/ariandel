@@ -2,7 +2,7 @@
 
 ## Overview
 
-Ariandel is a deterministic, scope-structured memory management model targeting compiled, statically-typed languages. It provides automatic heap memory reclamation without stop-the-world GC pauses, without manual memory management, without a borrow checker, and without cycle detection. Safety and allocation routing are resolved entirely at compile time via a mechanical desugaring transformation. The runtime overhead is a bump-pointer allocation and an atomic bitmask operation per scope boundary.
+Ariandel is a deterministic, scope-structured memory management model targeting compiled, statically-typed languages. It provides automatic heap memory reclamation without stop-the-world GC pauses, without manual memory management, without a borrow checker, and without cycle detection. Safety and allocation routing are resolved entirely at compile time via a mechanical desugaring transformation. The runtime overhead is a bump-pointer allocation and an atomic bitmask operation per scope boundary. For any compiled, statically typed language whose compiler implements the desugaring rule, allocation and deallocation performance is equivalent to a handwritten C bump allocator — the fastest allocation strategy available.
 
 ---
 
@@ -117,6 +117,8 @@ uint64_t arena_alloc(uint32_t arena_id, uint32_t size) {
 ```
 
 The caller always knows the target `arena_id` — it is either the current scope's arena or, for objects meant to outlive the current scope, the arena of the relevant outer scope read from the container handle's `arena_id` field.
+
+Handle dereference (`base + offset`) adds one integer addition over a raw pointer load. In practice this is dominated by arena contiguity: objects allocated within a scope are physically adjacent in memory, eliminating the cache misses that characterize fragmented heap allocators. When `deref()` is inlined — trivial for any optimizing C compiler — the base pointer is hoisted out of loops automatically, reducing the per-dereference cost to a single add.
 
 ---
 
