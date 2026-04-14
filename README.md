@@ -51,6 +51,8 @@ SCOPE(handle) {
 
 `SCOPE(ptr)` enters the arena of an existing handle without taking ownership. Use this to allocate into an outer scope's arena from within an inner scope.
 
+Any function called within a scope inherits the active arena automatically — `ALLOC` always routes to the current thread-local arena without requiring an explicit arena parameter. Functions that allocate simply call `ALLOC`; the caller controls which arena they land in by controlling which scope is active.
+
 ---
 
 ### Allocation
