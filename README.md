@@ -2,16 +2,16 @@
 
 ## Overview
 
-Ariandel is a deterministic, scope-structured memory management model targeting compiled, statically-typed languages. It provides automatic heap memory reclamation without stop-the-world GC pauses, without manual memory management, without a borrow checker, and without cycle detection. Safety and allocation routing are resolved entirely at compile time via a mechanical desugaring transformation. The runtime overhead is a bump-pointer allocation and an atomic bitmask operation per scope boundary. For any compiled, statically typed language whose compiler implements the desugaring rule, allocation and deallocation performance is equivalent to a handwritten C bump allocator — the fastest allocation strategy available.
+Ariandel is a deterministic, scope-structured memory management model targeting compiled, statically-typed languages. It provides automatic heap memory reclamation without stop-the-world GC pauses, without manual memory management, without a borrow checker, and without cycle detection. Every heap object lives in a scope-owned arena; scope exit resets the arena in O(1) regardless of how many objects were allocated. Allocation routing — which arena an object belongs to — is determined statically by scope structure and the `arena_id` embedded in every handle. The runtime overhead is a bump-pointer allocation and an atomic bitmask operation per scope boundary, equivalent in performance to a handwritten C bump allocator.
 
 ---
 
 ## Core Invariants
 
-1. **Stack allocation is permitted; returning a raw pointer into arena memory is not syntactically expressible.** A user may stack-allocate a struct, pass a raw pointer to it into a void function for construction or mutation, and use it freely within the same scope. Stack memory has a stable address and cannot move, so raw pointers to stack variables are safe within their scope. Raw pointers into arena-backed heap memory are not safe — arena backing slabs may be moved by `realloc()` as allocation grows, invalidating any raw pointer into them. Heap objects must always be referenced via `ARENA_PTR` handles, which encode `arena_id + offset` and resolve correctly at dereference time regardless of slab movement. Functions that allocate heap objects return `ARENA_PTR` handles — integers, not memory addresses — and are safe to return across scope boundaries. The borrow checker's core rule — no reference may outlive its owner — is enforced structurally: a raw pointer into arena memory cannot be returned because allocating functions return handles, not addresses. There is no mechanism to obtain a returnable raw pointer into arena memory in the first place.
+1. **Stack allocation is permitted within a scope; raw pointers into arena memory must not cross scope boundaries.** A user may stack-allocate a struct, pass a raw pointer to it into a void function for construction or mutation, and use it freely within the same scope. Stack memory has a stable address and cannot move, so raw pointers to stack variables are safe within their scope. Raw pointers into arena-backed heap memory are not safe across scope boundaries — arena backing slabs may be moved by `realloc()` as allocation grows, invalidating any raw pointer into them. Heap objects must be referenced via `ARENA_PTR` handles, which encode `arena_id + offset` and resolve correctly at dereference time regardless of slab movement. Functions that allocate heap objects should return `ARENA_PTR` handles — integers, not memory addresses — which are safe to pass across scope boundaries. A raw pointer obtained via `DEREF` is valid only within the current scope and must not be stored, returned, or passed to any call that may allocate. This is a programming discipline enforced by convention in the macro PoC; a language targeting Ariandel would enforce it via its type system.
 2. **All heap allocation is arena-backed.** Every heap object lives in exactly one arena. Scope cleanup is a bump-pointer reset — O(1) regardless of how many objects are freed.
-3. **Allocation is pre-routed at compile time.** The compiler determines the correct arena for every heap allocation before the program runs. No runtime escape analysis, no runtime promotion, no per-object lifetime tracking.
-4. **Everything remaining in a scope's arena at scope exit is dead by construction.** The desugaring rule guarantees that any object meant to outlive a scope was allocated into an outer arena from the start. Scope cleanup requires no per-object inspection.
+3. **Allocation routing is determined by scope structure, not by runtime object analysis.** Every `ALLOC` call routes to the active scope's arena — whichever arena was entered most recently via `SCOPE_NEW` or `SCOPE(ptr)`. No escape analysis, no runtime promotion, no per-object lifetime tracking. The programmer controls routing explicitly by controlling which scope is active at the point of allocation. A compiler targeting Ariandel would resolve arena assignment statically from scope structure; the macro PoC achieves the same semantics via the thread-local active arena pointer.
+4. **Everything remaining in a scope's arena at scope exit is intended to be dead.** Any object meant to outlive a scope must be allocated into an outer arena from the start — via `SCOPE(ptr)` in the macro PoC, or by statically routing into the correct arena in a compiler implementation. Scope cleanup requires no per-object inspection regardless: the bump pointer resets unconditionally. Correctness of that reset depends on the programmer having routed long-lived objects out of the scope before it exits.
 5. **Handles are stable; raw pointers from DEREF are ephemeral.** An `ARENA_PTR` handle is a plain integer and survives any number of allocations — the underlying arena slab may move via `realloc()`, but the handle resolves correctly at dereference time because it stores an offset, not an address. A raw pointer obtained via DEREF is valid only until the next allocation that triggers a slab resize. The programming rule follows directly: **handles cross function boundaries, raw pointers do not.** Functions receive and pass `ARENA_PTR` handles; DEREF is used at the leaf — field access, array indexing, memcpy source or destination — and discarded immediately. A raw pointer is never stored in a struct, never passed as an argument, and never cached across a call that may allocate.
 
 ---
@@ -28,7 +28,7 @@ Every heap reference is a packed `uint64_t` split evenly into two 32-bit fields:
 - **`arena_id`** (upper 32 bits): index into the global arena registry. Identifies which arena owns this object. Supports up to ~4.3 billion distinct arenas.
 - **`offset`** (lower 32 bits): byte offset from the start of that arena where the object's data begins. Supports up to 4GB per arena.
 
-Dereferencing a handle:
+Dereferencing a handle (off-implementation for readability):
 
 ```c
 void* deref(uint64_t handle) {
@@ -46,7 +46,7 @@ All references held by user code are handles. Stack-allocated values may be pass
 
 ## The Arena Pool
 
-The runtime maintains a dynamically extensible pool of arenas indexed by a **two-level availability bitmap**. The pool starts at 4,096 arenas (sufficient for the vast majority of programs) and adds capacity in 4,096-arena increments if all slots are simultaneously occupied.
+The runtime maintains a dynamically extensible pool of arenas indexed by a **two-level availability bitmap**. The pool starts at 4,096 arenas (sufficient for the vast majority of programs). Future iterations will add capacity in 4,096-arena increments if all slots are simultaneously occupied.
 
 ```c
 typedef struct {
@@ -131,26 +131,7 @@ Handle dereference (`base + offset`) adds one integer addition over a raw pointe
 
 ---
 
-## The Desugaring Rule
-
-This is Ariandel's core compile-time contribution. The rule is mechanical and applies uniformly across the language:
-
-> **Any function that allocates heap objects returns an `ARENA_PTR` handle. The allocation target is always the active scope's arena at the call site — determined statically by scope structure, not by runtime analysis.**
-
-```c
-// Source — MyConstructor allocates and returns a handle
-ARENA_PTR s = MyConstructor(args);   // allocates into the current scope's arena
-
-// What the compiler emits
-uint64_t s = arena_alloc(current_arena_id, sizeof(MyStruct));
-MyConstructor(s, args);              // writes into pre-allocated slot; handle returned
-```
-
-`sizeof` is always known at the call site because the language is statically typed. The transformation is mechanical with zero runtime decision-making. Sub-objects follow the same rule recursively: if `MyStruct` contains an `ARENA_PTR` field, that field is also pre-allocated into the appropriate arena before `MyConstructor` runs.
-
-**Consequence:** The allocation routing decision — which arena does this object belong to — is made entirely at compile time by reading the static scope structure. There is no runtime escape analysis, no promotion step, no per-object tracking.
-
-### Cross-scope allocation
+## Cross-Scope Allocation
 
 When an object needs to outlive the current scope, the programmer enters the target arena before allocating. The target arena is identified by any existing handle into it:
 
@@ -162,7 +143,7 @@ SCOPE(list_handle) {
 }
 ```
 
-`SCOPE(ptr)` does not free the arena on exit — it is owned by the outer scope. The compiler reads the `arena_id` field from the container handle to identify the target; this is a constant or a single field read, never a runtime search. Anything allocated inside the `SCOPE(ptr)` block routes into that arena automatically via the standard `ALLOC` path.
+`SCOPE(ptr)` resolves the target arena from the `arena_id` field of the handle — a single integer read, never a runtime search — and sets it as the active arena for the duration of the block without taking ownership. Anything allocated inside routes into that arena via the standard `ALLOC` path. On exit, the active arena is restored; the target arena is not freed.
 
 ---
 
@@ -173,18 +154,18 @@ At the exit of scope N (owning `arena_id = N`):
 1. Free the backing slab — bulk reclaims all objects in a single `free()` call
 2. Set bit N in the availability bitmap — marks the slot free for reuse
 
-That is the entire protocol. There is no per-object inspection, no fingerprint evaluation, no promotion step. Correctness follows from the desugaring rule: nothing in arena N at scope exit was supposed to survive — if it was, the compiler pre-allocated it into an outer arena.
+That is the entire protocol. There is no per-object inspection, no fingerprint evaluation, no promotion step. Correctness depends on the programmer having routed any long-lived objects into an outer arena before the scope exits — nothing remaining at scope exit was supposed to survive.
 
 Freeing the slab rather than retaining it is a deliberate design choice. A held but idle arena slab is dead memory for the lifetime of any async operation that outlives the scope — freeing it immediately keeps the memory footprint honest and avoids phantom allocations in concurrent workloads.
 
 ---
 
-## Memory Safety Guarantees
+## Memory Safety
 
 | Bug class | How Ariandel eliminates it |
 |---|---|
 | Dangling stack pointer | Allocating functions return `ARENA_PTR` handles (integers), not raw addresses — a dangling arena pointer cannot be produced at a return boundary |
-| Use-after-free | Cross-scope handles always point into the outer arena by the desugaring rule — anything inserted into an outer container is allocated into that container's arena, not the inner scope's. Inner arena resets therefore never invalidate handles visible to outer scopes. |
+| Use-after-free | Any object inserted into an outer container must be allocated into that container's arena via `SCOPE(ptr)` — inner arena resets therefore never invalidate handles visible to outer scopes, provided routing discipline is followed. |
 | Double free | No manual free calls exist |
 | Memory leak | Scope exit frees the entire arena slab unconditionally |
 | Cycles | Irrelevant — owned references form a DAG by scope structure; no cycle detector needed |
@@ -193,13 +174,13 @@ Freeing the slab rather than retaining it is a deliberate design choice. A held 
 
 ## What This Model Does Not Require
 
-- **No borrow checker.** The core borrow checker rule (no reference outlives its owner) is enforced by the syntax itself — returning a stack pointer is not a compiler error, it is simply not a thing the language can express. Stack allocation for local use is fully supported and carries no overhead.
-- **No escape analysis.** Allocation routing is determined mechanically by the desugaring rule and static scope structure.
+- **No borrow checker.** Lifetime correctness is expressed through scope structure and explicit arena routing rather than compiler-enforced ownership annotations. Stack allocation for local use is fully supported and carries no overhead.
+- **No escape analysis.** Allocation routing is determined by which scope is active at the point of allocation — the programmer controls this explicitly via `SCOPE_NEW` and `SCOPE(ptr)`.
 - **No per-object metadata.** Object headers carry no fingerprint, no generation counter, no reference count.
 - **No GC pauses.** All reclamation is O(1) at scope exit.
 - **No cycle detector.** Owned references cannot form cycles through scope structure.
-- **No promotion at runtime.** Compile-time desugaring routes allocations correctly from the start.
-- **No generation counter.** Generation counters exist to detect the ABA problem: a pool slot freed and reacquired by a new allocation, with a stale handle from the old occupant still live. Ariandel makes this condition unconstructable. By the time an arena slot is freed, the scope that owned it has exited — this is not a policy but a structural consequence of scoped execution. All cross-scope handles point into outer arenas by the desugaring rule, meaning they live in arenas that are still occupied. There is no execution path in which a live handle refers to a freed-and-reacquired slot. The generation counter problem is solved structurally, not by metadata.
+- **No promotion at runtime.** Objects are allocated into the correct arena at the point of allocation; nothing is moved or promoted after the fact.
+- **No generation counter.** Generation counters exist to detect the ABA problem: a pool slot freed and reacquired by a new allocation, with a stale handle from the old occupant still live. Ariandel makes this condition unconstructable. By the time an arena slot is freed, the scope that owned it has exited — this is not a policy but a structural consequence of scoped execution. Any handle that outlives its scope was allocated into an outer arena and therefore lives in an arena that is still occupied. There is no execution path in which a live handle refers to a freed-and-reacquired slot.
 
 ---
 
@@ -215,7 +196,7 @@ Freeing the slab rather than retaining it is a deliberate design choice. A held 
 
 ¹ Overhead per object is zero for regular scopes. Context scopes (resource management) write a small inline header at the base of their arena; this is a per-scope cost, not a per-object cost, and affects only scopes explicitly managing external resources.
 
-Ariandel's primary distinction from Tofte & Talpin region inference is that allocation routing is solved by a single mechanical desugaring rule rather than by static region inference over the full program. T&T regions are monolithic — a region lives or dies as a unit with no cross-region allocation routing at the call-site level. Ariandel makes cross-scope routing trivial by embedding `arena_id` in every handle and reading it at the call site.
+Ariandel's primary distinction from Tofte & Talpin region inference is that cross-scope allocation routing is delegated to the programmer at the call site rather than inferred by whole-program static analysis. T&T regions are monolithic — a region lives or dies as a unit with no cross-region allocation routing at the call-site level. Ariandel expresses cross-scope routing explicitly via `SCOPE(ptr)`, with the target arena identified by the `arena_id` embedded in any existing handle into it.
 
 ---
 
@@ -293,7 +274,7 @@ Each concurrent execution unit (coroutine, thread, async task) acquires its own 
 
 When a scope spawns an async or concurrent child, the parent's `arena_id` is passed to the child as an implicit runtime argument. This single mechanism enforces two properties simultaneously:
 
-1. **Allocation routing.** The child already holds the parent arena ID and can pre-route allocations that need to outlive its own scope directly into the parent arena via the desugaring rule — no runtime search, no separate mechanism.
+1. **Allocation routing.** The child already holds the parent arena ID and can route allocations that need to outlive its own scope directly into the parent arena via `SCOPE(ptr)` — no runtime search, no separate mechanism.
 2. **Lifetime dependency.** The parent, before resetting its arena, checks the availability bitmap against the set of child arena IDs it spawned. If any child arena is still marked occupied, the parent blocks. The child holding a reference to the parent arena ID makes the dependency relationship concrete and auditable in the runtime.
 
 This is the structured concurrency model: child scopes always exit before their parent, enforced mechanically by a bitmask check against IDs the parent already tracks. No separate lifetime annotation or dependency graph is required.
@@ -322,4 +303,4 @@ Ariandel specifies the first four rows of the table. The fifth — concurrent mu
 
 - **Handle width for large applications.** The standard handle is `uint64_t` (32/32 split), covering 4GB per arena and ~4.3 billion arena IDs — sufficient for over 99% of real-world programs. Applications requiring more space may widen to `uint128_t` with a 64/64 split. The layout, arithmetic, and bitmap logic are identical; only the word width changes.
 - **Bitmap expansion atomicity.** Regular bitmap acquisition and release are lock-free via C11 `_Atomic` on individual words. Pool expansion (appending a new 4,096-slot tier) is a multi-step transaction across multiple words and cannot be made atomic with `_Atomic` alone. A mutex is the correct mechanism — expansion is expected to occur at most once or twice in the lifetime of a massive concurrent application, making the lock penalty irrelevant. Physical RAM exhaustion is a far more binding constraint than the cost of a single mutex acquisition.
-- **Handle validity after arena reuse.** When a slot is freed and reacquired by a new scope, the backing memory is not zeroed — only the bump pointer resets. A stale handle with the old `arena_id` persisting into the new scope would read uninitialised or foreign data. The model's argument against this is sound: the scope that held the stale handle has exited by the time the arena is released, so no live reference to that handle can exist. This is a design axiom — "a handle cannot outlive the scope that created it" — that the desugaring rule and structured concurrency together enforce. The PoC should stress-test this under concurrent arena reuse to confirm no edge case violates it in practice.
+- **Handle validity after arena reuse.** When a slot is freed and reacquired by a new scope, the backing memory is not zeroed — only the bump pointer resets. A stale handle with the old `arena_id` persisting into the new scope would read uninitialised or foreign data. The model's argument against this is sound: the scope that held the stale handle has exited by the time the arena is released, so no live reference to that handle can exist. This is a design axiom — "a handle cannot outlive the scope that created it" — that arena routing discipline and structured concurrency together enforce. The PoC should stress-test this under concurrent arena reuse to confirm no edge case violates it in practice.
