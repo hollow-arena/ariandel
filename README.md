@@ -8,7 +8,7 @@ Ariandel is a deterministic, scope-structured memory management model targeting 
 
 ## Core Invariants
 
-1. **Stack allocation is permitted; returning a stack pointer is not syntactically expressible.** A user may stack-allocate a struct, pass a raw pointer to it into a void function for construction or mutation, and use it freely within the same scope. Stack memory has a stable address and cannot move, so raw pointers to stack variables are safe within their scope. Raw pointers into arena-backed heap memory are not safe — arena backing slabs may be moved by `realloc()` as allocation grows, invalidating any raw pointer into them. Heap objects must always be referenced via handles, which resolve `base + offset` at dereference time and remain valid across realloc. What the language makes mechanically impossible is *returning* a raw pointer from a function — because any function with a pointer return type is subject to the desugaring rule, which pre-allocates the return value in the caller's arena. There is no syntax for "return a pointer to my stack frame" because pointer-returning functions are, by definition, arena-routed. The borrow checker's core rule — no reference may outlive its owner — is enforced by omission of syntax rather than by compiler error.
+1. **Stack allocation is permitted; returning a raw pointer into arena memory is not syntactically expressible.** A user may stack-allocate a struct, pass a raw pointer to it into a void function for construction or mutation, and use it freely within the same scope. Stack memory has a stable address and cannot move, so raw pointers to stack variables are safe within their scope. Raw pointers into arena-backed heap memory are not safe — arena backing slabs may be moved by `realloc()` as allocation grows, invalidating any raw pointer into them. Heap objects must always be referenced via `ARENA_PTR` handles, which encode `arena_id + offset` and resolve correctly at dereference time regardless of slab movement. Functions that allocate heap objects return `ARENA_PTR` handles — integers, not memory addresses — and are safe to return across scope boundaries. The borrow checker's core rule — no reference may outlive its owner — is enforced structurally: a raw pointer into arena memory cannot be returned because allocating functions return handles, not addresses. There is no mechanism to obtain a returnable raw pointer into arena memory in the first place.
 2. **All heap allocation is arena-backed.** Every heap object lives in exactly one arena. Scope cleanup is a bump-pointer reset — O(1) regardless of how many objects are freed.
 3. **Allocation is pre-routed at compile time.** The compiler determines the correct arena for every heap allocation before the program runs. No runtime escape analysis, no runtime promotion, no per-object lifetime tracking.
 4. **Everything remaining in a scope's arena at scope exit is dead by construction.** The desugaring rule guarantees that any object meant to outlive a scope was allocated into an outer arena from the start. Scope cleanup requires no per-object inspection.
@@ -40,7 +40,7 @@ void* deref(uint64_t handle) {
 
 The 32/32 split is symmetric and keeps handle arithmetic simple. The `arena_id` space (~4.3 billion) is large enough to be a practical ceiling for any realistic concurrency model; a process will exhaust physical RAM long before exhausting arena IDs. The 4GB offset ceiling is generous for any single scope's allocations.
 
-All references held by user code are handles. Stack-allocated values may be passed by raw pointer within the same scope (e.g. a struct constructed in-place via a void function) — stack memory has a stable address and cannot move. Raw pointers into arena-backed heap memory are not safe: each arena's backing slab may be moved by `realloc()` as the arena grows, invalidating any raw pointer into it. The handle design is specifically what makes heap references stable across realloc — the `base` address in `deref()` is resolved at dereference time against the arena's current slab address, so a moved slab is transparent to any code holding a handle. Raw pointers into arena memory are therefore not a supported pattern. Raw pointers are never returned from functions — pointer-returning functions are arena-routed by the desugaring rule. There are no invalid handle states: a handle either refers to a live object in its arena or the arena has been reset and the handle is unreachable.
+All references held by user code are handles. Stack-allocated values may be passed by raw pointer within the same scope (e.g. a struct constructed in-place via a void function) — stack memory has a stable address and cannot move. Raw pointers into arena-backed heap memory are not safe: each arena's backing slab may be moved by `realloc()` as the arena grows, invalidating any raw pointer into it. The handle design is specifically what makes heap references stable across realloc — the `base` address in `deref()` is resolved at dereference time against the arena's current slab address, so a moved slab is transparent to any code holding a handle. Raw pointers into arena memory are therefore not a supported pattern. Functions that allocate heap objects return `ARENA_PTR` handles — integers, not addresses — so a dangling arena pointer cannot be produced at a return boundary. There are no invalid handle states: a handle either refers to a live object in its arena or the arena has been reset and the handle is unreachable.
 
 ---
 
@@ -127,7 +127,7 @@ The bump pointer is aligned to 8 bytes before each allocation. If the slab has i
 
 The caller always knows the target `arena_id` — it is either the current scope's arena or, for objects meant to outlive the current scope, the arena of the relevant outer scope read from the container handle's `arena_id` field.
 
-Handle dereference (`base + offset`) adds one integer addition over a raw pointer load. In practice this is dominated by arena contiguity: objects allocated within a scope are physically adjacent in memory, eliminating the cache misses that characterize fragmented heap allocators. When `deref()` is inlined — trivial for any optimizing C compiler — the base pointer is hoisted out of loops automatically, reducing the per-dereference cost to a single add.
+Handle dereference (`base + offset`) adds one integer addition over a raw pointer load. In practice this is dominated by arena contiguity: objects allocated within a scope are physically adjacent in memory, eliminating the cache misses that characterize fragmented heap allocators. A native compiler implementing Ariandel would inline `deref()` and hoist the `base` pointer out of hot loops automatically, reducing the per-dereference cost to a single add. The C macro shim cannot do this — `DEREF` resolves the base pointer on every call, and the overhead is measurable in compute-intensive loops (see Empirical Results).
 
 ---
 
@@ -135,33 +135,34 @@ Handle dereference (`base + offset`) adds one integer addition over a raw pointe
 
 This is Ariandel's core compile-time contribution. The rule is mechanical and applies uniformly across the language:
 
-> **Any function that returns a pointer is transformed into a pre-allocation in the caller's arena followed by a void constructor call writing into that slot.**
+> **Any function that allocates heap objects returns an `ARENA_PTR` handle. The allocation target is always the active scope's arena at the call site — determined statically by scope structure, not by runtime analysis.**
 
 ```c
-// Source
-MyStruct* s = MyConstructor(args);
+// Source — MyConstructor allocates and returns a handle
+ARENA_PTR s = MyConstructor(args);   // allocates into the current scope's arena
 
-// Desugared
+// What the compiler emits
 uint64_t s = arena_alloc(current_arena_id, sizeof(MyStruct));
-MyConstructor(s, args);   // void — writes into pre-allocated handle
+MyConstructor(s, args);              // writes into pre-allocated slot; handle returned
 ```
 
-This transformation is applied recursively to sub-objects: if `MyStruct` contains a pointer field, that field is also pre-allocated into the appropriate arena before `MyConstructor` runs.
+`sizeof` is always known at the call site because the language is statically typed. The transformation is mechanical with zero runtime decision-making. Sub-objects follow the same rule recursively: if `MyStruct` contains an `ARENA_PTR` field, that field is also pre-allocated into the appropriate arena before `MyConstructor` runs.
 
-**Consequence:** The allocation routing decision — which arena does this object belong to — is made entirely at compile time by reading the static scope structure and the `arena_id` fields of any container handles in scope. There is no runtime decision, no escape analysis, and no promotion step.
+**Consequence:** The allocation routing decision — which arena does this object belong to — is made entirely at compile time by reading the static scope structure. There is no runtime escape analysis, no promotion step, no per-object tracking.
 
 ### Cross-scope allocation
 
-When an object is inserted into a container that lives in an outer scope's arena, the target arena is read directly from the container's handle:
+When an object needs to outlive the current scope, the programmer enters the target arena before allocating. The target arena is identified by any existing handle into it:
 
 ```c
-// Appending a new object into a list owned by an outer scope
-uint64_t target_arena = handle_arena_id(list_handle);   // read from handle
-uint64_t new_obj = arena_alloc(target_arena, sizeof(Obj));
-list_append(list_handle, new_obj);
+// Enter the arena that owns list_handle; allocate new_obj into it
+SCOPE(list_handle) {
+    ARENA_PTR new_obj = ALLOC(sizeof(Obj));   // routed into list_handle's arena
+    list_append(list_handle, new_obj);
+}
 ```
 
-The compiler emits `target_arena` as a constant or a simple handle field read — never a runtime search.
+`SCOPE(ptr)` does not free the arena on exit — it is owned by the outer scope. The compiler reads the `arena_id` field from the container handle to identify the target; this is a constant or a single field read, never a runtime search. Anything allocated inside the `SCOPE(ptr)` block routes into that arena automatically via the standard `ALLOC` path.
 
 ---
 
@@ -182,7 +183,7 @@ Freeing the slab rather than retaining it is a deliberate design choice. A held 
 
 | Bug class | How Ariandel eliminates it |
 |---|---|
-| Dangling stack pointer | Returning a stack pointer is not syntactically expressible — pointer-returning functions are arena-routed by definition |
+| Dangling stack pointer | Allocating functions return `ARENA_PTR` handles (integers), not raw addresses — a dangling arena pointer cannot be produced at a return boundary |
 | Use-after-free | Cross-scope handles always point into the outer arena by the desugaring rule — anything inserted into an outer container is allocated into that container's arena, not the inner scope's. Inner arena resets therefore never invalidate handles visible to outer scopes. |
 | Double free | No manual free calls exist |
 | Memory leak | Scope exit frees the entire arena slab unconditionally |
@@ -220,31 +221,39 @@ Ariandel's primary distinction from Tofte & Talpin region inference is that allo
 
 ## Empirical Results
 
-The following benchmarks were produced by the PoC implementation against a balanced BST of **1,000,000 nodes**, comparing idiomatic C (`malloc` / recursive `free`) against the Ariandel macro shim backed by the arena runtime. Both programs were compiled with GCC on Windows (MinGW64), no optimisation flags. `deref` is `static inline` and hoisted by the compiler.
+The following benchmarks were produced by the PoC implementation compiled with GCC (MinGW64) on Windows, no optimisation flags. `DEREF` is `static inline`. Numbers are representative of repeated runs; do not use results from debugger-attached runs (GDB intercepts heap operations and inflates cleanup times dramatically).
 
-| Phase | Idiomatic C | Ariandel | Speedup |
+### Tree builder — 1,000,000 nodes
+
+Balanced BST built from a sorted array of 1M integers. Idiomatic C allocates one node per `malloc` and frees via recursive traversal (`free_tree`). Ariandel allocates all nodes into a single `SCOPE_NEW` arena and exits the scope at the end of `main`.
+
+| Phase | Idiomatic C | Ariandel | Ratio |
 |---|---|---|---|
-| Build | 506 ms | 36 ms | **14×** |
-| Cleanup | 383 ms | 1 ms | **383×** |
-| **Total** | **889 ms** | **37 ms** | **24×** |
+| Build | 53 ms | 54 ms | **~1×** |
+| Cleanup | 31 ms | 1 ms | **~30×** |
+| **Total** | **84 ms** | **55 ms** | **~1.5×** |
 
-**Cleanup** is the headline result and the direct confirmation of the O(1) scope exit claim. Freeing 1,000,000 individually `malloc`'d nodes via recursive traversal costs 383 ms. Resetting an arena's bump pointer costs 1 ms — a single integer write and a `free()` on one slab. The ratio scales linearly with N; the arena reset does not.
+**Cleanup** is the direct confirmation of the O(1) scope exit claim. Freeing 1M individually `malloc`'d nodes via recursive traversal costs 31 ms. Resetting an arena's bump pointer costs ~1 ms — a single integer write and a `free()` on one slab. The ratio scales linearly with N; the arena reset does not.
 
-**Build** is the result the spec mentions but undersells. Arena contiguity — all nodes physically adjacent in the same slab — eliminates the cache misses and per-allocation overhead that `malloc` incurs at scale. The 14× build speedup is a free consequence of the allocation model, not a separately engineered optimisation.
+**Build** is within measurement noise between the two implementations. Both complete in approximately 53 ms for 1M nodes against a fresh system allocator. The arena contiguity advantage — all nodes physically adjacent in the same slab — is present but does not dominate here. It widens under heap fragmentation and in long-running processes where the system allocator's per-call overhead accumulates.
 
-### 12-Queens — collect from recursion (14,200 solutions)
+### 13-Queens — collect from recursion (73,712 solutions)
 
-The second benchmark exercises the cross-scope allocation pattern: deep backtracking recursion collects solutions into an outer scope's arena via `ALLOC_INTO`. Idiomatic C `malloc`s each solution individually and frees them by iterating the full list. Both programs use identical backtracking logic; the only difference is memory management.
+Deep backtracking recursion collects all solutions into a dynamically-resized array. Both implementations use identical backtracking logic and an array-based collector with capacity doubling. The Ariandel version stores the board and solution handles as `ARENA_PTR` values inside a single `SCOPE_NEW`; the baseline uses raw pointers and `malloc`/`realloc`.
 
-| Phase | Idiomatic C | Ariandel | Speedup |
+| Phase | Idiomatic C | Ariandel | Ratio |
 |---|---|---|---|
-| Solve | 282 ms | 301 ms | **~1×** |
-| Cleanup | 325 ms | 3 ms | **108×** |
-| **Total** | **607 ms** | **304 ms** | **~2×** |
+| Solve | 1,600 ms | 2,108 ms | **0.76×** |
+| Cleanup | 3 ms | 1 ms | **~3×** |
+| **Total** | **1,603 ms** | **2,109 ms** | **0.76×** |
 
-Solve time carries a small overhead (~7%) versus idiomatic C. This is an honest consequence of the handle discipline: raw pointer accesses are replaced by `DEREF` calls that compute `base + offset` at each access site. The backtracking loop dereferences the board handle on every placement and every safety check — the overhead is real and expected, not a model failure. Cleanup tells the same story as the tree benchmark: 14,200 individual `free()` calls cost 325 ms; one arena reset costs 3 ms. The O(1) cleanup claim holds regardless of how many objects were collected.
+**Solve** is slower with Ariandel. The `is_safe` check runs in a tight recursive loop and accesses the board via `DEREF(board, int)[r]` on every iteration — one `base + offset` add per element versus a direct pointer load in the baseline. At N=13 depth with 73,712 solutions this overhead is clearly measurable: approximately 30% slower. The `DEREF` cost is not free in compute-intensive inner loops.
 
-These numbers are unoptimized. No `-O2`, no arena pre-sizing. Production use with compiler optimization could vary results in either direction.
+**Cleanup** at this solution count is fast in both implementations — the baseline's per-solution `free` loop completes in ~3 ms, so the O(1) arena reset offers only a marginal absolute saving here. The cleanup asymptote holds in principle; it dominates where per-object reclamation is expensive relative to solve time, as in the tree benchmark.
+
+The honest takeaway: Ariandel's model is strongest where scope-boundary reclamation is the dominant cost — bulk object cleanup, tree-shaped workloads, large arenas. In tight numeric loops where every element access goes through a handle dereference, the indirection overhead is real. A production compiler targeting Ariandel would hoist the `base` pointer out of hot loops as a standard optimisation; the macro shim cannot do this automatically.
+
+These numbers are unoptimized. No `-O2`, no arena pre-sizing. Production use with compiler optimisation would reduce the `DEREF` overhead significantly.
 
 ---
 

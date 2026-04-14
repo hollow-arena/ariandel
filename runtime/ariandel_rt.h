@@ -1,9 +1,16 @@
 #pragma once
 
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
+
+#if defined(_MSC_VER)
+#  define THREAD_LOCAL __declspec(thread)
+#else
+#  define THREAD_LOCAL __thread
+#endif
 
 #define DEF_ARENA_SIZE 256         // 256 bytes = 0.25KB per initial arena memory allocation
 #define MAX_ARENA_SIZE UINT32_MAX  // Max size 4GB for PoC
@@ -20,9 +27,9 @@ typedef struct {
 // Size is ~64.5KB, could put on stack or heap in theory, will put on heap for PoC
 // Later, struct could live on stack with pointer to heap for dynamic-length words when expansion is added
 typedef struct {
-    uint64_t        top_word;      // Find the first uint64_t in bottom_word that has an available slot
-    uint64_t        bot_word[64];  // This model supports 64 x 64 = 4,096 arenas at program start
-    ARIANDEL__arena arenas[4096];  // Actual arena structs
+    _Atomic uint64_t top_word;      // Find the first uint64_t in bottom_word that has an available slot
+    _Atomic uint64_t bot_word[64];  // This model supports 64 x 64 = 4,096 arenas at program start
+    ARIANDEL__arena  arenas[4096];  // Actual arena structs
 } ARIANDEL__registry;
 
 ARIANDEL__registry* ARIANDEL__create_registry();
@@ -42,4 +49,8 @@ void      ARIANDEL__free_arena(  ARIANDEL__registry *registry, ARIANDEL__arena *
 
 static inline void* ARIANDEL__deref_ptr(ARIANDEL__registry *registry, ARENA_PTR ptr) {
     return registry->arenas[ptr >> 32].memory + (ptr & UINT32_MAX);
+}
+
+static inline void  ARIANDEL__memcpy(ARIANDEL__registry *registry, ARENA_PTR dst, ARENA_PTR src, size_t size) {
+    memcpy(ARIANDEL__deref_ptr(registry, dst), ARIANDEL__deref_ptr(registry, src), size);
 }

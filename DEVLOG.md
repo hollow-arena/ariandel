@@ -156,14 +156,92 @@ Ariandel specifies a **context scope** — a scoped construct whose syntax is de
 
 ---
 
+## Phase 7 — Rethinking the Void Constraint
+
+Building the tree and n-queens PoC benchmarks made one thing clear: the void-constructor desugaring rule is unreasonable to impose on a real programmer. Writing useful programs where every allocating function must be rewritten as a void constructor that writes into a pre-allocated slot produces code that is difficult to read, difficult to compose, and hostile to recursion. The tree builder's original macro version required pre-allocating child slots before recursing just to hand slots to the recursive calls — backwards from how any programmer would naturally structure the problem.
+
+More critically, the void constraint does not actually solve the problem it was introduced to address. Consider:
+
+```python
+def unsafe(arr: list) -> None:
+    obj = MyObj()
+    arr.append(obj)  # void function — but obj is in the callee's arena
+```
+
+The function is void. That doesn't help. `obj` was allocated in the callee's scope arena. When the callee returns, that arena resets, and `arr` now holds a dangling handle. The bug is not in the return type — it is in the allocation site. `obj` needed to be allocated into `arr`'s arena from the start.
+
+**The real invariant was never "no pointer-returning functions." It was "allocations that outlive a scope must be routed to the correct outer arena at the point of allocation."** The void transformation was one mechanical way to enforce that invariant, but it conflated the symptom (returning a raw pointer) with the disease (wrong allocation site).
+
+The revised approach, validated by `tree_builder_macro_2.c` and `n_queens_macro.c`, drops the void constraint entirely:
+
+- Functions may return `ARENA_PTR` handles — handles are integers, not raw pointers, and are safe to return.
+- Functions that allocate into an outer container accept an explicit `ARENA_PTR caller` parameter and call `ALLOC_INTO(caller, ...)`.
+- The programmer's rule is simple and local: **if an allocation needs to outlive this scope, use `ALLOC_INTO` with the handle of the container that will own it.**
+
+This is more idiomatic, composes naturally with recursion, and is no less safe — the allocation routing discipline is the same, just expressed at the `ALLOC_INTO` call site rather than enforced by a void signature constraint. The unsafe append case above is still prevented: `ALLOC_INTO(arr, sizeof(MyObj))` routes `obj` into `arr`'s arena, and the problem does not arise.
+
+---
+
+## Phase 8 — Macro API Redesign (`ariandel.h`)
+
+Building the PoC exposed structural problems in the original macro layer (`ariandel.h`):
+
+**`SCOPE_BEGIN`/`SCOPE_END` had no safety guarantee.** A `return` or `break` inside the block skips `SCOPE_END`, leaking the arena. The programmer is responsible for ensuring every exit path reaches the closing macro — exactly the kind of manual discipline Ariandel is designed to eliminate.
+
+**Global state was per-translation-unit.** `__registry` and `__arena` were declared `static`, meaning each translation unit that includes the header gets its own copy. Multi-TU builds silently produce multiple independent registries and arena pointers with no linker error.
+
+**No thread-local arena support.** `__arena` was a plain global, making concurrent use of the macro API undefined behaviour.
+
+The redesign addresses all three.
+
+### Automatic cleanup via `__attribute__((cleanup))`
+
+`SCOPE_NEW` is implemented as a `for`-loop with a scope guard variable annotated with `__attribute__((cleanup(ARIANDEL__cleanup_new_scope)))`. GCC and Clang guarantee the cleanup function fires on any exit from the loop body — normal fall-through, `return`, or `break`. The arena is always freed; no paired closing macro is required.
+
+```c
+#define SCOPE_NEW \
+    for (ARIANDEL__scope_guard arn__guard \
+             __attribute__((cleanup(ARIANDEL__cleanup_new_scope))) \
+             = { ARIANDEL__create_arena(arn__registry), arn__tl_arena }; \
+         (arn__tl_arena = arn__guard.scope, arn__guard.scope != NULL); \
+         (ARIANDEL__free_arena(arn__registry, arn__guard.scope), arn__guard.scope = NULL))
+```
+
+The same trick is applied to `ARIANDEL_INIT()`, which opens a root scope for the entire program. `ARIANDEL_DESTROY()` closes the matching brace and frees the registry. Early return from `main` is safe — the cleanup attribute fires regardless, and program exit reclaims everything anyway.
+
+This is a GCC/Clang extension. MSVC does not support `__attribute__((cleanup))` and `__builtin_ctz` (used in arena acquisition); the runtime is not portable to MSVC.
+
+### Thread-local arena context
+
+`arn__tl_arena` is declared `THREAD_LOCAL` — `__thread` on GCC/Clang, `__declspec(thread)` on MSVC. Each thread maintains its own active arena pointer. `SCOPE_NEW` saves the previous value into the scope guard on entry and restores it on cleanup, so nested scopes on any thread compose correctly without coordination.
+
+### `SCOPE(ptr)` replaces `ALLOC_INTO`
+
+The original `ALLOC_INTO(handle, size)` macro allocated into the arena of an existing handle without entering it as the active scope. This was dropped in favour of `SCOPE(ptr)`, which enters the arena that owns an existing handle and sets it as the active scope for the duration of the block — without taking ownership (the arena is not freed on exit). Any `ALLOC` call inside a `SCOPE(ptr)` block routes into that arena. This is more composable: the allocation logic inside the block is identical to any `SCOPE_NEW` block, with no separate macro variant needed at the call site.
+
+### Global state ownership
+
+`arn__registry` and `arn__tl_arena` are declared `extern` in `ariandel_2.h` and defined in `ariandel_rt.c`. `ariandel_rt.c` includes only `ariandel_rt.h` — it has no dependency on the macro layer. The `extern` declarations in `ariandel_2.h` resolve at link time against the definitions in `ariandel_rt.c`, giving correct single-definition semantics across any number of translation units.
+
+The previous macro layer has been replaced entirely. All current tests use `ariandel.h`.
+
+---
+
 ## Where Things Stand
 
-The spec (SPEC.md) is complete enough to serve as the basis for both a PoC implementation and a whitepaper. The model is coherent, the major holes are closed, and the remaining open questions are implementation parameters rather than design gaps:
+The model is coherent, the PoC is working, and the macro API has been stabilised. The current runtime consists of two files:
+
+- `ariandel_rt.h` / `ariandel_rt.c` — the low-level engine: arena structs, two-level bitmap registry, bump allocator, lock-free acquire/release. Not intended for direct use.
+- `ariandel.h` — the public macro API: `ARIANDEL_INIT`, `ARIANDEL_DESTROY`, `SCOPE_NEW`, `SCOPE(ptr)`, `ALLOC`, `DEREF`, `COPY`. This is the layer a programmer or compiler targets.
+
+Current benchmarks (`tree_builder_macro_2.c`, `n_queens_macro_2.c`) validate two distinct workload profiles: bulk tree reclamation (where arena cleanup dominates) and recursive backtracking with dense handle dereference (where `DEREF` overhead is measurable). Both profiles are documented honestly in the spec.
+
+The remaining open questions are implementation parameters rather than design gaps:
 
 - Handle width policy for large applications (`uint128_t` upgrade path)
 - Arena backing memory growth policy (configurable default size, `realloc()` up to 4GB max)
-- Handle validity under concurrent arena reuse — the argument is sound but the PoC should stress-test it
+- Handle validity under concurrent arena reuse — the argument is sound but the PoC should stress-test it under concurrent arena churn
 
 **The novel contribution** relative to prior art (primarily Tofte & Talpin 1997 region inference): allocation routing is solved by a single mechanical compile-time desugaring rule rather than by whole-program static region inference. The arena ID embedded in every handle makes cross-scope routing a constant-time field read rather than an analysis problem. T&T regions are all-or-nothing; Ariandel routes individual allocations across scope boundaries without any inference pass.
 
-**Target:** arXiv preprint positioning Ariandel in the space between region-based memory management and ownership type systems, with a working PoC and benchmark comparison against a naive bump allocator baseline.
+**Target:** arXiv preprint positioning Ariandel in the space between region-based memory management and ownership type systems, with a working PoC and benchmark comparison against idiomatic C baselines.

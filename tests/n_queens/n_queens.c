@@ -3,7 +3,7 @@
 #include <string.h>
 #include <time.h>
 
-#define N 12
+#define N 13
 
 static double ms(clock_t a, clock_t b) {
     return (double)(b - a) / CLOCKS_PER_SEC * 1000.0;
