@@ -23,16 +23,13 @@ gcc your_program.c runtime/ariandel_rt.c -I runtime -std=c11 -o your_program
 
 ## Configuration
 
-`REGISTRY_SIZE` controls the arena pool capacity. Define it before including `ariandel.h`:
+`REGISTRY_SIZE` controls the arena pool capacity. Default is `uint16_t` (4,096 arenas). Define it before including `ariandel.h`:
 
 ```c
-#define REGISTRY_SIZE uint8_t    //    512 arenas (8³),  minimal registry footprint
-#define REGISTRY_SIZE uint16_t   //  4,096 arenas (16³), default
-#define REGISTRY_SIZE uint32_t   // 32,768 arenas (32³), larger registry struct
-#define REGISTRY_SIZE uint64_t   // 262,144 arenas (64³), very large registry struct
+#define REGISTRY_SIZE uint16_t   // 4,096 arenas — default
 ```
 
-Valid values: `uint8_t`, `uint16_t`, `uint32_t`, `uint64_t`. The registry struct size grows with `REGISTRY_SIZE` — choose based on expected concurrent scope depth and memory budget.
+See [SPEC.md](SPEC.md) for the full configuration table and handle-width tradeoffs.
 
 ---
 
@@ -76,7 +73,7 @@ Any function called within a scope inherits the active arena automatically — `
 ARENA_PTR handle = ALLOC(sizeof(MyStruct));
 ```
 
-Allocates `obj_size` bytes in the current active arena. Returns an `ARENA_PTR` — a `uint64_t` packed handle whose upper bits encode the `arena_id` and lower bits encode the byte offset within that arena. The exact split is determined by `REGISTRY_SIZE` (default `uint16_t`: 12-bit arena_id / 52-bit offset). Handles are stable across reallocations; raw pointers from `DEREF` are not.
+Allocates the specified number of bytes in the current active arena. Returns an `ARENA_PTR` — a `uint64_t` packed handle whose upper bits encode the `arena_id` and lower bits encode the byte offset within that arena. The exact split is determined by `REGISTRY_SIZE` (default `uint16_t`: 12-bit arena_id / 52-bit offset). Handles are stable across reallocations; raw pointers from `DEREF` are not.
 
 ---
 
@@ -140,7 +137,7 @@ SCOPE_NEW {
 }
 ```
 
-What memory leak?
+Loop-scoped allocation:
 
 ```c
 SCOPE_NEW {
@@ -156,14 +153,13 @@ while (1) {
     SCOPE_NEW {
         ARENA_PTR ptr = ALLOC(sizeof(BigObject));
         // do stuff with ptr
-    } // Frees each BigObject per loop, this will never run out of memory
+    } // Frees each BigObject per loop iteration — this will never run out of memory
 }
 ```
 
-Intuitive lifetimes!
+Functions inherit the caller's scope:
 
 ```c
-
 ARENA_PTR alloc_int(int x) {
     ARENA_PTR ptr = ALLOC(sizeof(int));
     *(DEREF(ptr, int)) = x;
@@ -175,13 +171,14 @@ int main() {
 
     SCOPE_NEW {
         ARENA_PTR y = alloc_int(42); // 42 lives on heap, no dangling pointer
-    } // 42 freed at same time that y goes out of scope by default
+    } // 42 freed when the scope exits
 
     ARIANDEL_DESTROY()
     return 0;
 }
-
 ```
+
+This is safe because `alloc_int` inherits the active arena from its caller — `ALLOC` always routes to the current scope's arena. The returned `ARENA_PTR` is a packed integer encoding `arena_id + offset`, not a raw pointer, so it resolves correctly at dereference time regardless of how deep the call stack went. No dangling pointer is possible at a return boundary.
 
 ---
 
@@ -197,3 +194,5 @@ All benchmarks compiled with GCC (MinGW64), no optimisation flags.
 | 13-Queens — 73,712 solutions | Cleanup | 3 ms | 1 ms | ~3× |
 
 Cleanup is the headline result — O(1) bump reset versus O(n) traversal. The n-queens solve regression is real: `DEREF` in tight inner loops adds measurable overhead that a native compiler would eliminate by hoisting the base pointer. See [SPEC.md](SPEC.md) for full benchmark discussion.
+
+**Concurrency stress test (Black Swan):** 64 threads × 1,000,000 scope transitions each (~65M total), with randomly-sized allocations and nested scopes, run without any explicit synchronization in user code. The test is a destructive probe for the atomic three-level bitmap — no double-acquired slots, no lost releases, no data races across 65M round-trips. All ordering is provided by the `_Atomic` bitmap operations in the runtime.

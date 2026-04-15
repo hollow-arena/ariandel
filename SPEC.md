@@ -18,6 +18,21 @@ Ariandel is a deterministic, scope-structured memory management model targeting 
 
 ## The Pointer Handle
 
+### Configuration
+
+`REGISTRY_SIZE` sets the arena pool capacity and the `arena_id` / offset split in every handle. Define it before including `ariandel.h`:
+
+```c
+#define REGISTRY_SIZE uint8_t    //    512 arenas (8³),  minimal registry footprint
+#define REGISTRY_SIZE uint16_t   //  4,096 arenas (16³), default
+#define REGISTRY_SIZE uint32_t   // 32,768 arenas (32³), larger registry struct
+#define REGISTRY_SIZE uint64_t   // 262,144 arenas (64³), very large registry struct
+```
+
+The registry struct size grows with `REGISTRY_SIZE` — choose based on expected concurrent scope depth and memory budget. In all configurations the per-arena offset field is large enough that physical RAM is the binding constraint, not handle width.
+
+### Handle layout
+
 Every heap reference is a `uint64_t` packed handle split into two fields whose widths are derived from `REGISTRY_SIZE`:
 
 ```
@@ -150,7 +165,7 @@ Freeing the slab rather than retaining it is a deliberate design choice. A held 
 
 | Bug class | How Ariandel eliminates it |
 |---|---|
-| Dangling stack pointer | Allocating functions return `ARENA_PTR` handles (integers), not raw addresses — a dangling arena pointer can only be produced if explicitly allocating into a new scope |
+| Dangling pointers | Allocating functions return `ARENA_PTR` handles (integers), not raw addresses — a dangling arena pointer can only be produced if explicitly allocating into a new scope |
 | Use-after-free | Any object inserted into an outer container must be allocated into that container's arena via `SCOPE(ptr)` — inner arena resets therefore never invalidate handles visible to outer scopes, provided routing discipline is followed. |
 | Double free | No manual free calls exist |
 | Memory leak | Scope exit frees the entire arena slab unconditionally |
