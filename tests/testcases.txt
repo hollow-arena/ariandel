@@ -6,10 +6,13 @@ Every node is a heap object allocated via handle. The tree lives in the outermos
 ## 2. N-Queens
 Classic backtracking search over an NxN board. Solutions discovered deep in the recursion are collected into an array owned by the outermost scope — cross-scope allocation is handled by entering the outer arena via SCOPE(ptr) before allocating. Failed branches leave nothing behind. Board state lives in an inner scope and is released O(1) when the search unwinds. The cleanup contrast is pronounced: idiomatic C requires one free() per solution plus the list pointer array, while Ariandel releases all collected solutions in a single arena reset regardless of count.
 
+## 3. Black Swan Stress Test (threading.c)
+64 concurrent threads, each running 1,000,000 iterations of `SCOPE_NEW` with randomly-sized allocations (1–1,024 bytes) and occasional nested scopes. Every scope entry acquires an arena slot from the three-level bitmap via atomic CAS; every scope exit releases it. The test hammers the lock-free bitmap acquire/release path under maximum contention and exercises the thread-local arena pointer (`arn__tl_arena`) under real concurrent load. At 64 threads × 1M iterations, approximately 65 million scope transitions are processed. Passing this test confirms that concurrent arena acquisition and release do not corrupt the bitmap, that thread-local arena state is isolated correctly, and that there are no data races in the allocation or cleanup paths under load. Named "Black Swan" for its intent: to trigger race conditions that would not appear under normal workloads.
+
 NOT YET IMPLEMENTED:
 
-## 3. Recursive Descent Parser
+## 4. Recursive Descent Parser
 Structurally similar to the tree builder but grounded in a concrete, recognizable task. An input string is parsed into an AST where every node is a heap object living in the caller's arena. Each parse frame is its own scope — failed parses are discarded for free, successful ones route their nodes into the outer scope's arena. Makes the cross-scope allocation story easy to follow and directly relevant to real compiler/tooling workloads.
 
-## 4. Collect Results from Recursion (N-Queens variant)
+## 5. Collect Results from Recursion (N-Queens variant)
 Deep recursion discovers results that must be appended into a list owned by the outermost scope. Every result write is a cross-scope allocation — the inner frame enters the outer arena via SCOPE(ptr) and allocates directly into it. Failed branches leave nothing behind. This case is the clearest isolated demonstration of the SCOPE(ptr) pattern and the structured lifetime guarantee: inner scopes exit and their arenas reset, while the result list in the outer arena remains intact.

@@ -222,6 +222,18 @@ The honest takeaway: Ariandel's model is strongest where scope-boundary reclamat
 
 These numbers are unoptimized. No `-O2`, no arena pre-sizing. Production use with compiler optimisation would reduce the `DEREF` overhead significantly.
 
+### Black Swan — 64 threads × 1,000,000 scope transitions
+
+64 concurrent threads each execute 1,000,000 iterations of `SCOPE_NEW` with randomly-sized allocations (1–1,024 bytes) and a nested `SCOPE_NEW` every 100 iterations — approximately 65 million scope transitions total. Each scope transition is a full round-trip through the atomic bitmap acquire and release paths. The test runs without any explicit synchronization in user code; all ordering is provided by the `_Atomic` bitmap operations in the runtime.
+
+This test validates three properties under genuine concurrency:
+
+1. **Bitmap correctness under contention.** 64 threads simultaneously acquiring and releasing arena slots via atomic CAS on the three-level bitmap. No slot is double-acquired or lost.
+2. **Thread-local isolation.** Each thread maintains its own `arn__tl_arena` pointer. Nested scopes save and restore the prior value via the `ARIANDEL__scope_guard` struct — correctness requires that no thread observes another thread's active arena.
+3. **No data races in allocation or cleanup.** Each arena is private to the thread and scope that acquired it; concurrent threads never share a bump pointer or backing slab.
+
+The test is a destructive probe, not a performance benchmark — if the bitmap or thread-local logic has a race condition, 65 million iterations under 64 threads will find it.
+
 ---
 
 ## Finalizers and External Resources
