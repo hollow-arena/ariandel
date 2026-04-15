@@ -102,21 +102,22 @@ The fingerprint bitmask — the result of three phases of derivation — was no 
 
 With allocation routing solved at compile time, the runtime model reduced to:
 
-**The pointer handle** — a packed `uint64_t` with a 32/32 split:
-- Upper 32 bits: `arena_id` — index into the global arena pool
-- Lower 32 bits: `offset` — byte offset from the arena's base
+**The pointer handle** — a `uint64_t` packed handle with a variable split determined by `REGISTRY_SIZE`:
+- Upper `ARENA_ID_BITS` bits: `arena_id` — index into the global arena pool. `ARENA_ID_BITS = 3 × log₂(REGISTRY_BITS)`.
+- Lower `ARENA_OFFSET_BITS` bits: `offset` — byte offset from the arena's base. Ranges from 46 bits (`uint64_t`) to 55 bits (`uint8_t`).
 
-The 32/32 split is symmetric, keeps handle arithmetic simple, supports ~4.3 billion simultaneous arenas (a practical ceiling; RAM is the real constraint), and 4GB per arena (generous for any single scope). For applications exceeding these bounds, widening to `uint128_t` with a 64/64 split requires no architectural changes.
+Pool capacity and per-arena address space are both determined by a single `REGISTRY_SIZE` configuration — selecting the type sets both simultaneously. In all configurations the per-arena address space dwarfs physical RAM; the handle is not the limiting factor.
 
 **The bitmask repurposed.** The scope-depth fingerprint bitmask was no longer needed for per-object lifetime tracking — but the same data structure turned out to be the ideal availability map for the arena pool itself.
 
-A **two-level bitmap** indexes the pool:
-- `bitmap_top` (1 word): bit N set = `bitmap_bottom[N]` has a free slot
-- `bitmap_bottom` (64 words): each bit = one arena slot (64 × 64 = 4,096 total)
+A **three-level bitmap** indexes the pool:
+- `word1` (1 word): bit N set = `word2[N]` has a free slot
+- `word2[REGISTRY_BITS]`: bit N set = `word3[...][N]` has a free slot
+- `word3[REGISTRY_BITS²]`: each bit = one arena slot (`REGISTRY_BITS³` total)
 
-Arena acquisition: two `ctz` calls, always. O(log₆₄ N) — a fixed constant of at most a handful of operations for any realistic pool size. Practically O(1).
+Arena acquisition: three `ctz` calls, always. O(log_RB N) — a fixed constant regardless of pool size. Practically O(1).
 
-Regular bitmap operations (acquire/release) are lock-free via C11 `_Atomic`. Pool expansion (appending a new 4,096-slot tier when fully occupied) is a multi-step transaction that requires a mutex — but expansion is expected to occur at most once or twice in the lifetime of a massive concurrent application. Physical RAM exhaustion is a far more binding constraint.
+Regular bitmap operations (acquire/release) are lock-free via C11 `_Atomic`. Pool expansion when all slots are occupied is a multi-step transaction that requires a mutex — but expansion is expected to be rare in practice. Physical RAM exhaustion is a far more binding constraint.
 
 ---
 
@@ -238,9 +239,8 @@ Current benchmarks (`tree_builder_macro_2.c`, `n_queens_macro_2.c`) validate two
 
 The remaining open questions are implementation parameters rather than design gaps:
 
-- Handle width policy for large applications (`uint128_t` upgrade path)
-- Arena backing memory growth policy (configurable default size, `realloc()` up to 4GB max)
 - Handle validity under concurrent arena reuse — the argument is sound but the PoC should stress-test it under concurrent arena churn
+- Dynamic pool expansion — current PoC exits on pool exhaustion; expansion requires a mutex-guarded multi-step transaction across bitmap levels
 
 **The novel contribution** relative to prior art (primarily Tofte & Talpin 1997 region inference): allocation routing is solved by a single mechanical compile-time desugaring rule rather than by whole-program static region inference. The arena ID embedded in every handle makes cross-scope routing a constant-time field read rather than an analysis problem. T&T regions are all-or-nothing; Ariandel routes individual allocations across scope boundaries without any inference pass.
 

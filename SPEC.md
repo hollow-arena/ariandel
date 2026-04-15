@@ -18,27 +18,27 @@ Ariandel is a deterministic, scope-structured memory management model targeting 
 
 ## The Pointer Handle
 
-Every heap reference is a packed `uint64_t` split evenly into two 32-bit fields:
+Every heap reference is a `uint64_t` packed handle split into two fields whose widths are derived from `REGISTRY_SIZE`:
 
 ```
- 63                32 31                 0
-  [    arena_id     |       offset       ]
+ 63          ARENA_OFFSET_BITS             0
+  [  arena_id  |        offset            ]
 ```
 
-- **`arena_id`** (upper 32 bits): index into the global arena registry. Identifies which arena owns this object. Supports up to ~4.3 billion distinct arenas.
-- **`offset`** (lower 32 bits): byte offset from the start of that arena where the object's data begins. Supports up to 4GB per arena.
+- **`arena_id`** (upper `ARENA_ID_BITS` bits): index into the global arena registry. `ARENA_ID_BITS = 3 × log₂(REGISTRY_BITS)`, where `REGISTRY_BITS = sizeof(REGISTRY_SIZE) × 8`. With the default `uint16_t`, this is 12 bits — 4,096 distinct arenas.
+- **`offset`** (lower `ARENA_OFFSET_BITS` bits): byte offset from the start of that arena. `ARENA_OFFSET_BITS = 64 − ARENA_ID_BITS`, ranging from 55 bits (~36 PB addressable per arena) with `uint8_t` to 46 bits (~70 TB) with `uint64_t`.
 
-Dereferencing a handle (off-implementation for readability):
+Dereferencing a handle:
 
 ```c
 void* deref(uint64_t handle) {
-    uint32_t arena_id = (uint32_t)(handle >> 32);
-    uint32_t offset   = (uint32_t)(handle & 0xFFFFFFFF);
+    uint64_t arena_id = handle >> ARENA_OFFSET_BITS;
+    uint64_t offset   = handle & ARENA_OFFSET_MASK;
     return arena_registry[arena_id].base + offset;
 }
 ```
 
-The 32/32 split is symmetric and keeps handle arithmetic simple. The `arena_id` space (~4.3 billion) is large enough to be a practical ceiling for any realistic concurrency model; a process will exhaust physical RAM long before exhausting arena IDs. The 4GB offset ceiling is generous for any single scope's allocations.
+`ARENA_OFFSET_BITS` and `ARENA_OFFSET_MASK` are compile-time constants derived from `REGISTRY_SIZE`. Pool capacity and handle split are a single configuration choice — selecting `REGISTRY_SIZE` sets both simultaneously. In all configurations the per-arena address space dwarfs what physical RAM can back; the handle is not the limiting factor.
 
 All references held by user code are handles. Stack-allocated values may be passed by raw pointer within the same scope (e.g. a struct constructed in-place via a void function) — stack memory has a stable address and cannot move. Raw pointers into arena-backed heap memory are not safe: each arena's backing slab may be moved by `realloc()` as the arena grows, invalidating any raw pointer into it. The handle design is specifically what makes heap references stable across realloc — the `base` address in `deref()` is resolved at dereference time against the arena's current slab address, so a moved slab is transparent to any code holding a handle. Raw pointers into arena memory are therefore not a supported pattern. Functions that allocate heap objects return `ARENA_PTR` handles — integers, not addresses — so a dangling arena pointer cannot be produced at a return boundary. There are no invalid handle states: a handle either refers to a live object in its arena or the arena has been reset and the handle is unreachable.
 
@@ -46,64 +46,50 @@ All references held by user code are handles. Stack-allocated values may be pass
 
 ## The Arena Pool
 
-The runtime maintains a dynamically extensible pool of arenas indexed by a **two-level availability bitmap**. The pool starts at 4,096 arenas (sufficient for the vast majority of programs). Future iterations will add capacity in 4,096-arena increments if all slots are simultaneously occupied.
+The runtime maintains a pool of arenas indexed by a **three-level availability bitmap**. Pool capacity is determined by `REGISTRY_SIZE`: with the default `uint16_t`, the pool holds 16³ = 4,096 arenas.
 
 ```c
 typedef struct {
-    uint8_t* base;       // start of arena memory
-    uint32_t bump;       // next free byte offset
-    uint32_t capacity;   // total arena size
-} Arena;
-
-Arena    arena_pool[MAX_ARENAS];    // grows as needed
-uint64_t bitmap_top;                // 1 word  — bit N set = bottom[N] has a free slot
-uint64_t bitmap_bottom[64];         // 64 words — each bit = one arena slot (64 × 64 = 4,096)
+    REGISTRY_SIZE word1;                              // 1 word  — bit N set = word2[N] has a free slot
+    REGISTRY_SIZE word2[REGISTRY_BITS];               // bit N set = word3[...] has a free slot
+    REGISTRY_SIZE word3[REGISTRY_BITS * REGISTRY_BITS]; // each bit = one arena slot
+    Arena         arenas[REGISTRY_BITS * REGISTRY_BITS * REGISTRY_BITS];
+} Registry;
 ```
 
-### Two-Level Bitmap
+### Three-Level Bitmap
 
-The availability map is a two-level hierarchy. Each bit in `bitmap_top` summarises an entire word in `bitmap_bottom`:
-
-- `bitmap_top` bit N = "`bitmap_bottom[N]` contains at least one free arena slot"
-- `bitmap_bottom[N]` bit M = "arena `N×64 + M` is free"
-
-A set bit means *free* throughout. Both levels are initialised to all-ones at startup.
+The availability map is a three-level hierarchy. A set bit means *free* throughout. All levels are initialised to all-ones at startup.
 
 **Acquiring an arena (scope entry):**
 ```c
-uint32_t word = ctz(bitmap_top);                    // which bottom word has a free slot?
-uint32_t bit  = ctz(bitmap_bottom[word]);           // which bit in that word?
-uint32_t arena_id = word * 64 + bit;               // computed — no search
+uint32_t top = ctz(word1);                         // which word2 group has a free slot?
+uint32_t mid = ctz(word2[top]);                    // which word3 group?
+uint32_t bot = ctz(word3[top * RB + mid]);         // which arena slot?
+uint32_t arena_id = top * RB*RB + mid * RB + bot;  // computed — no search
 
-bitmap_bottom[word] &= ~(1ULL << bit);             // mark slot occupied
-if (bitmap_bottom[word] == 0)
-    bitmap_top &= ~(1ULL << word);                 // bottom word full — clear top bit
-
-arena_pool[arena_id].bump = 0;                     // reset bump pointer
+word3[top * RB + mid] &= ~(1 << bot);             // mark slot occupied; propagate up if empty
 ```
 
 **Releasing an arena (scope exit):**
 ```c
-free(arena_pool[arena_id].base);                   // release backing slab (PoC — production would reset bump and retain slab)
-arena_pool[arena_id].base = NULL;
-
-uint32_t word = arena_id / 64;
-uint32_t bit  = arena_id % 64;
-bitmap_bottom[word] |= (1ULL << bit);              // mark slot free
-bitmap_top         |= (1ULL << word);              // bottom word has a free slot again
+free(arenas[arena_id].base);
+word3[...] |= (1 << bot_bit);                     // mark slot free; restore up if was empty
+word2[top_bit] |= (1 << mid_bit);
+word1          |= (1 << top_bit);
 ```
 
-Acquisition is two `ctz` calls regardless of pool size — O(log₆₄ N), which is a fixed constant of at most a handful of levels for any realistic arena count. Practically indistinguishable from O(1).
+Acquisition is three `ctz` calls regardless of pool size — O(log_RB N), a fixed constant. Practically indistinguishable from O(1). All bitmap operations use C11 `_Atomic` with appropriate acquire/release ordering for concurrent correctness.
 
-Arena slot 0 is permanently reserved at registry initialisation (`bot_word[0] &= ~1ULL`). This guarantees that `0ULL` is never a valid handle, making it a safe `ARENA_NULL` sentinel without any extra runtime check.
+Arena slot 0 is permanently reserved at registry initialisation (`word3[0] &= ~1`). This guarantees that `0ULL` is never a valid handle, making it a safe `ARENA_NULL` sentinel without any extra runtime check.
 
-**Pool expansion:** If `bitmap_top == 0` (all 4,096 slots occupied) and a new arena is needed, the pool appends another 4,096-slot tier. Given that each arena is a separate scope, 4,096 simultaneous scopes represents an extraordinary concurrency load; expansion is expected to be rare in practice. Physical RAM will be the binding constraint long before arena IDs are. *Pool expansion is not yet implemented in this alpha PoC — exhaustion currently exits the process.*
+**Pool expansion:** If all slots are simultaneously occupied and a new arena is needed, the pool would append additional capacity. Given that each arena is a separate scope, exhausting the pool represents an extraordinary concurrency load; physical RAM will be the binding constraint long before arena IDs are. *Dynamic expansion is not yet implemented in this PoC — exhaustion currently exits the process.*
 
 For concurrent execution, acquisition and release use atomic operations (`atomic_fetch_and` / `atomic_fetch_or`) on the bitmap words, giving each concurrent call frame an isolated arena with no shared mutable state between them.
 
 ### Arena backing memory
 
-Each arena is backed by a memory slab acquired from the system allocator. Arenas start at a configurable default size (256 bytes in the PoC) and grow via `realloc()` as needed, using a 1.5× growth factor up to the 4GB maximum imposed by the 32-bit offset field. Allocations are 8-byte aligned.
+Each arena is backed by a memory slab acquired from the system allocator. Arenas start at a configurable default size (256 bytes in the PoC) and grow via `realloc()` as needed, using a 1.5× growth factor up to `MAX_ARENA_SIZE` — the maximum expressible offset for the configured `REGISTRY_SIZE`. Allocations are 8-byte aligned.
 
 The backing slab is freed at scope exit and reallocated fresh at scope entry. Every scope boundary pays one `malloc` and one `free` on the slab in addition to the bitmap operations. Freeing immediately rather than retaining idle slabs keeps memory footprint honest across concurrent workloads where a freed arena slot may sit unoccupied for an indeterminate period.
 
@@ -114,12 +100,12 @@ The backing slab is freed at scope exit and reallocated fresh at scope entry. Ev
 All allocation is bump allocation into a specific arena:
 
 ```c
-uint64_t arena_alloc(uint32_t arena_id, uint32_t size) {
+uint64_t arena_alloc(uint64_t arena_id, size_t size) {
     Arena* a = &arena_pool[arena_id];
-    uint32_t offset = (a->bump + 7) & ~7u;        // 8-byte align
+    uint64_t offset = (a->bump + 7) & ~(uint64_t)7;   // 8-byte align
     if (a->capacity - offset < size) arena_grow(a, size);
     a->bump = offset + size;
-    return ((uint64_t)arena_id << 32) | offset;   // packed 32/32 handle
+    return (arena_id << ARENA_OFFSET_BITS) | offset;   // packed handle
 }
 ```
 
@@ -164,7 +150,7 @@ Freeing the slab rather than retaining it is a deliberate design choice. A held 
 
 | Bug class | How Ariandel eliminates it |
 |---|---|
-| Dangling stack pointer | Allocating functions return `ARENA_PTR` handles (integers), not raw addresses — a dangling arena pointer cannot be produced at a return boundary |
+| Dangling stack pointer | Allocating functions return `ARENA_PTR` handles (integers), not raw addresses — a dangling arena pointer can only be produced if explicitly allocating into a new scope |
 | Use-after-free | Any object inserted into an outer container must be allocated into that container's arena via `SCOPE(ptr)` — inner arena resets therefore never invalidate handles visible to outer scopes, provided routing discipline is followed. |
 | Double free | No manual free calls exist |
 | Memory leak | Scope exit frees the entire arena slab unconditionally |
@@ -301,6 +287,6 @@ Ariandel specifies the first four rows of the table. The fifth — concurrent mu
 
 ## Open Questions
 
-- **Handle width for large applications.** The standard handle is `uint64_t` (32/32 split), covering 4GB per arena and ~4.3 billion arena IDs — sufficient for over 99% of real-world programs. Applications requiring more space may widen to `uint128_t` with a 64/64 split. The layout, arithmetic, and bitmap logic are identical; only the word width changes.
+- **Handle width for very large applications.** Pool capacity and per-arena address space are configurable via `REGISTRY_SIZE`. The per-arena offset field ranges from 46 bits (`uint64_t`) to 55 bits (`uint8_t`), and the current bumper/capacity fields are `uint64_t`, so neither the pool nor the per-arena size is a practical constraint. Applications requiring more than `uint64_t` handles can handle can widen to `uint128_t`; the layout, arithmetic, and bitmap logic are identical.
 - **Bitmap expansion atomicity.** Regular bitmap acquisition and release are lock-free via C11 `_Atomic` on individual words. Pool expansion (appending a new 4,096-slot tier) is a multi-step transaction across multiple words and cannot be made atomic with `_Atomic` alone. A mutex is the correct mechanism — expansion is expected to occur at most once or twice in the lifetime of a massive concurrent application, making the lock penalty irrelevant. Physical RAM exhaustion is a far more binding constraint than the cost of a single mutex acquisition.
 - **Handle validity after arena reuse.** When a slot is freed and reacquired by a new scope, the backing memory is not zeroed — only the bump pointer resets. A stale handle with the old `arena_id` persisting into the new scope would read uninitialised or foreign data. The model's argument against this is sound: the scope that held the stale handle has exited by the time the arena is released, so no live reference to that handle can exist. This is a design axiom — "a handle cannot outlive the scope that created it" — that arena routing discipline and structured concurrency together enforce. The PoC should stress-test this under concurrent arena reuse to confirm no edge case violates it in practice.

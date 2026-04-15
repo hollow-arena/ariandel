@@ -21,6 +21,21 @@ gcc your_program.c runtime/ariandel_rt.c -I runtime -std=c11 -o your_program
 
 ---
 
+## Configuration
+
+`REGISTRY_SIZE` controls the arena pool capacity. Define it before including `ariandel.h`:
+
+```c
+#define REGISTRY_SIZE uint8_t    //    512 arenas (8³),  minimal registry footprint
+#define REGISTRY_SIZE uint16_t   //  4,096 arenas (16³), default
+#define REGISTRY_SIZE uint32_t   // 32,768 arenas (32³), larger registry struct
+#define REGISTRY_SIZE uint64_t   // 262,144 arenas (64³), very large registry struct
+```
+
+Valid values: `uint8_t`, `uint16_t`, `uint32_t`, `uint64_t`. The registry struct size grows with `REGISTRY_SIZE` — choose based on expected concurrent scope depth and memory budget.
+
+---
+
 ## API
 
 ### Lifecycle
@@ -42,7 +57,7 @@ SCOPE_NEW {
     // fresh arena, freed automatically on any exit
 }
 
-SCOPE(handle) {
+SCOPE(ptr) {
     // enters the arena that owns handle — does not free on exit
 }
 ```
@@ -61,7 +76,7 @@ Any function called within a scope inherits the active arena automatically — `
 ARENA_PTR handle = ALLOC(sizeof(MyStruct));
 ```
 
-Allocates `obj_size` bytes in the current active arena. Returns an `ARENA_PTR` — a `uint64_t` encoding `arena_id` (upper 32 bits) and `offset` (lower 32 bits). Handles are stable across reallocations; raw pointers from `DEREF` are not.
+Allocates `obj_size` bytes in the current active arena. Returns an `ARENA_PTR` — a `uint64_t` packed handle whose upper bits encode the `arena_id` and lower bits encode the byte offset within that arena. The exact split is determined by `REGISTRY_SIZE` (default `uint16_t`: 12-bit arena_id / 52-bit offset). Handles are stable across reallocations; raw pointers from `DEREF` are not.
 
 ---
 
@@ -123,6 +138,49 @@ SCOPE_NEW {
         }
     } // inner scope freed; item survives in list's arena
 }
+```
+
+What memory leak?
+
+```c
+SCOPE_NEW {
+    for (int i = 0; i < 1000; i++) {
+        ARENA_PTR ptr = ALLOC(sizeof(BigObject));
+        // do stuff with ptr
+    }
+} // All BigObject heap pointers freed here
+
+// Similarly
+
+while (1) {
+    SCOPE_NEW {
+        ARENA_PTR ptr = ALLOC(sizeof(BigObject));
+        // do stuff with ptr
+    } // Frees each BigObject per loop, this will never run out of memory
+}
+```
+
+Intuitive lifetimes!
+
+```c
+
+ARENA_PTR alloc_int(int x) {
+    ARENA_PTR ptr = ALLOC(sizeof(int));
+    *(DEREF(ptr, int)) = x;
+    return ptr;
+}
+
+int main() {
+    ARIANDEL_INIT()
+
+    SCOPE_NEW {
+        ARENA_PTR y = alloc_int(42); // 42 lives on heap, no dangling pointer
+    } // 42 freed at same time that y goes out of scope by default
+
+    ARIANDEL_DESTROY()
+    return 0;
+}
+
 ```
 
 ---
