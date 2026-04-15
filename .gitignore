@@ -2,3 +2,4 @@ deprecated/
 .vscode/
 
 *.exe
+*.o
