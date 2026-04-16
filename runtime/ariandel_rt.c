@@ -13,7 +13,7 @@ ARIANDEL__registry* ARIANDEL__create_registry() {
         exit(1);
     }
 
-    // Set all bitmap words to all-ones — every slot free
+    // Set all bitmap words to all-ones, every slot free
     atomic_store(&registry->word1, (REGISTRY_SIZE)~0ULL);
     for (int i = 0; i < (int)REGISTRY_BITS; i++)
         atomic_store(&registry->word2[i], (REGISTRY_SIZE)~0ULL);
@@ -46,7 +46,7 @@ ARIANDEL__arena* ARIANDEL__create_arena(ARIANDEL__registry *registry) {
         // Level 2: find a word3 group with free slots
         mid_val = atomic_load_explicit(&registry->word2[top], memory_order_acquire);
         if (!mid_val) {
-            // Stale word1 bit — clear it and retry.
+            // Stale word1 bit - clear it and retry.
             // If a free races here and sets word2, it will also restore word1 via fetch_or.
             atomic_fetch_and_explicit(&registry->word1, ~((REGISTRY_SIZE)1 << top), memory_order_acq_rel);
             if (atomic_load_explicit(&registry->word2[top], memory_order_acquire) != 0)
@@ -60,7 +60,7 @@ ARIANDEL__arena* ARIANDEL__create_arena(ARIANDEL__registry *registry) {
         // Level 3: find a free arena slot
         bot_val = atomic_load_explicit(&registry->word3[word3_idx], memory_order_acquire);
         if (!bot_val) {
-            // Stale word2 bit — clear it and retry.
+            // Stale word2 bit - clear it and retry.
             atomic_fetch_and_explicit(&registry->word2[top], ~((REGISTRY_SIZE)1 << mid), memory_order_acq_rel);
             if (atomic_load_explicit(&registry->word3[word3_idx], memory_order_acquire) != 0)
                 atomic_fetch_or_explicit(&registry->word2[top], (REGISTRY_SIZE)1 << mid, memory_order_release);
@@ -151,7 +151,7 @@ void ARIANDEL__free_arena(ARIANDEL__registry *registry, ARIANDEL__arena *arena) 
     uint64_t top_bit   = id / ((uint64_t)REGISTRY_BITS * REGISTRY_BITS);
     uint64_t word3_idx = top_bit * REGISTRY_BITS + mid_bit;
 
-    // Restore availability bottom-up — create_arena reads top-down,
+    // Restore availability bottom-up, create_arena reads top-down,
     // so a racing acquire always sees a consistent state.
     atomic_fetch_or_explicit(&registry->word3[word3_idx], (REGISTRY_SIZE)1 << bot_bit, memory_order_release);
     atomic_fetch_or_explicit(&registry->word2[top_bit],   (REGISTRY_SIZE)1 << mid_bit, memory_order_release);

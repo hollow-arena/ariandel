@@ -26,7 +26,7 @@ sizeof(REGISTRY_SIZE) == 8,
 
 #define REGISTRY_BITS     (sizeof(REGISTRY_SIZE) * 8)
 
-// log2(REGISTRY_BITS) as a constant expression — __builtin_ctz is not valid in
+// log2(REGISTRY_BITS) as a constant expression, __builtin_ctz is not valid in
 // constant expressions (struct sizes, static_assert), so use a ternary instead.
 #define ARN__LOG2_BITS \
     ((sizeof(REGISTRY_SIZE) == 8) ? 6 : \
@@ -37,7 +37,7 @@ sizeof(REGISTRY_SIZE) == 8,
 #define ARENA_OFFSET_BITS (64 - ARENA_ID_BITS)
 #define ARENA_OFFSET_MASK ((1ULL << ARENA_OFFSET_BITS) - 1ULL)
 
-// ctz helper — always use ctzll; smaller types zero-extend to ull correctly.
+// always use ctzll; smaller types zero-extend to uint64_t correctly.
 #define ARN__CTZ(x) __builtin_ctzll((unsigned long long)(x))
 
 #define DEF_ARENA_SIZE 256         // 256 bytes = 0.25KB per initial arena memory allocation
@@ -52,7 +52,7 @@ typedef struct {
 } ARIANDEL__arena;
 
 // Pool capacity = REGISTRY_BITS³ arenas (4,096 with default uint16_t). Registry lives on the heap.
-// Dynamic expansion on exhaustion is not yet implemented — pool size is fixed at compile time.
+// Dynamic expansion on exhaustion is not yet implemented, pool size is fixed at compile time.
 typedef struct {
     _Atomic REGISTRY_SIZE word1;
     _Atomic REGISTRY_SIZE word2[REGISTRY_BITS];
