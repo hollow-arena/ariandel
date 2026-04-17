@@ -4,6 +4,12 @@ Scope-structured arena memory model for compiled languages. Automatic O(1) heap 
 
 ---
 
+## Dev Announcement
+
+The Ariandel arena-scope memory model is being integrated and leveraged with the [Darksign](https://github.com/hollow-arena/darksign) project, this repo will stay active for archival purposes, but may not reflect the latest changes available. Please check out Darksign for the latest additions and features.
+
+---
+
 ## Requirements
 
 - GCC or Clang (C11)
